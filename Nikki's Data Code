@@ -1,1 +1,1175 @@
+## takes forever to go through (about 5 hours) and got a dice of 0.012797839276870263
 
+from scipy import stats
+from skimage.filters import threshold_otsu
+from skimage.filters import try_all_threshold
+import matplotlib.pyplot as plt
+import datetime
+import numpy as np
+import scipy.ndimage
+import os
+import tensorflow as tf
+from random import sample
+import keras
+from keras.models import *
+from keras.layers import *
+from keras.optimizers import *
+from keras.callbacks import ModelCheckpoint, LearningRateScheduler
+from keras import backend as K
+from keras.preprocessing.image import ImageDataGenerator
+from keras.utils import *
+#import tensorflow_addons as tfa
+from sklearn.metrics import jaccard_score
+from sklearn.metrics import confusion_matrix, precision_recall_curve, f1_score, roc_auc_score, auc, recall_score, auc, roc_curve
+import time
+from skimage.metrics import structural_similarity as ssim
+
+ultrasound_fullname = r'\Users\Jessica\Desktop\Processed Data\Training\training_image_array.npy'
+segmentation_fullname = r'\Users\Jessica\Desktop\Processed Data\Training\training_segmentation_array.npy'
+    
+ultrasound_data = np.load(ultrasound_fullname)
+segmentation_data = np.load(segmentation_fullname)
+    
+print(segmentation_data.shape)
+ultrasound_size = ultrasound_data.shape[1:4]
+    
+num_ultrasound = ultrasound_data.shape[0]
+num_segmentation = segmentation_data.shape[0]
+
+print("Found {} ultrasound images and {} segmentations".format(num_ultrasound, num_segmentation))
+print("Ultrasound size: {}".format(ultrasound_size))
+
+test_ultrasound_fullname = r'\Users\Jessica\Desktop\Processed Data\Testing\test_image_array.npy'
+test_segmentation_fullname = r'\Users\Jessica\Desktop\Processed Data\Testing\test_segmentation_array.npy'
+    
+print("Reading test ultrasound from: {}".format(test_ultrasound_fullname))
+print("Reading test segmentation from : {}".format(test_segmentation_fullname))
+    
+test_ultrasound_data = np.load(test_ultrasound_fullname)
+test_segmentation_data = np.load(test_segmentation_fullname)
+    
+num_test_ultrasound = test_ultrasound_data.shape[0]
+num_test_segmentation = test_segmentation_data.shape[0]
+    
+print("Found {} test ultrasound images and {} segmentations".format(num_test_ultrasound, num_test_segmentation))
+
+val_ultrasound_fullname = r'\Users\Jessica\Desktop\Processed Data\Validation\validation_image_array.npy'
+val_segmentation_fullname = r'\Users\Jessica\Desktop\Processed Data\Validation\validation_segmentation_array.npy'
+    
+print("Reading test ultrasound from: {}".format(val_ultrasound_fullname))
+print("Reading test segmentation from : {}".format(val_segmentation_fullname))
+    
+val_ultrasound_data = np.load(val_ultrasound_fullname)
+val_segmentation_data = np.load(val_segmentation_fullname)
+    
+num_val_ultrasound = val_ultrasound_data.shape[0]
+num_val_segmentation = val_segmentation_data.shape[0]
+    
+print("Found {} test ultrasound images and {} segmentations".format(num_val_ultrasound, num_val_segmentation))
+
+ultrasound_data = np.reshape(ultrasound_data, (ultrasound_data.shape[0], 128, 128, 128, 1))
+segmentation_data = np.reshape(segmentation_data, (segmentation_data.shape[0], 128, 128, 128, 1))
+    
+test_ultrasound_data = np.reshape(test_ultrasound_data, (test_ultrasound_data.shape[0], 128, 128, 128, 1))
+test_segmentation_data = np.reshape(test_segmentation_data, (test_segmentation_data.shape[0], 128, 128, 128, 1))
+    
+val_ultrasound_data = np.reshape(val_ultrasound_data, (val_ultrasound_data.shape[0], 128, 128, 128, 1))
+val_segmentation_data = np.reshape(val_segmentation_data, (val_segmentation_data.shape[0], 128, 128, 128, 1))
+
+batch_size = 5
+num_epochs = 200
+    
+max_rotation_angle = 2.5
+max_shift = 0.1
+max_zoom = 0.1
+
+def multi_slice_viewer(volume):
+    remove_keymap_conflicts({'j', 'k'})
+    fig, ax = plt.subplots()
+    ax.volume = volume
+    ax.index = volume.shape[0] // 2
+    ax.imshow(volume[ax.index])
+    fig.canvas.mpl_connect('key_press_event', process_key)
+    
+def process_key(event):
+    fig = event.canvas.figure
+    ax = fig.axes[0]
+    if event.key == 'j':
+        previous_slice(ax)
+    elif event.key == 'k':
+        next_slice(ax)
+    fig.canvas.draw()
+    
+def previous_slice(ax):
+    volume = ax.volume
+    ax.index = (ax.index - 1) % volume.shape[0]  # wrap around using %
+    ax.images[0].set_array(volume[ax.index])
+    
+def next_slice(ax):
+    volume = ax.volume
+    ax.index = (ax.index + 1) % volume.shape[0]
+    ax.images[0].set_array(volume[ax.index])
+    
+def remove_keymap_conflicts(new_keys_set):
+    for prop in plt.rcParams:
+        if prop.startswith('keymap.'):
+            keys = plt.rcParams[prop]
+            remove_list = set(keys) & new_keys_set
+            for key in remove_list:
+                keys.remove(key)
+                
+class UltrasoundSegmentationBatchGenerator(keras.utils.Sequence):
+        
+    def __init__(self,
+                 x_set,
+                 y_set,
+                 batch_size,
+                 image_dimensions,
+                 shuffle=True,
+                 n_channels=1,
+                 n_classes=2):
+        self.x = x_set
+        self.y = y_set
+        self.batch_size = batch_size
+        self.image_dimensions = image_dimensions
+        print("Generator created for image size: {}".format(self.image_dimensions))
+        self.shuffle = shuffle
+        self.n_channels = n_channels
+        self.n_classes = n_classes
+        self.number_of_images = self.x.shape[0]
+        self.indices = np.arange(self.number_of_images)
+        if self.shuffle == True:
+            np.random.shuffle(self.indices)
+                
+    def __len__(self):
+        return int(np.floor(self.number_of_images / self.batch_size))
+        
+    def on_epoch_end(self):
+        self.indices = np.arange(self.number_of_images)
+        if self.shuffle == True:
+            np.random.shuffle(self.indices)
+        
+    def __getitem__(self, index):
+        batch_indices = self.indices[index*self.batch_size : (index+1)*self.batch_size]
+        x = np.empty((self.batch_size, *self.image_dimensions, self.n_channels))
+        y = np.empty((self.batch_size, *self.image_dimensions))
+            
+        for i in range(self.batch_size):
+            flip_flag = np.random.randint(2)
+            if flip_flag == 1:
+                x[i,:,:,:,:] = np.flip(self.x[batch_indices[i],:,:,:,:], axis=0)
+                y[i,:,:,:]   = np.flip(self.y[batch_indices[i],:,:,:,0], axis=0)
+            else:
+                x[i,:,:,:,:] = self.x[batch_indices[i],:,:,:,:]
+                y[i,:,:,:]   = self.y[batch_indices[i],:,:,:,0]
+                
+            # Rotations
+            
+        x_rot = np.copy(x)
+        y_rot = np.copy(y)
+            
+                
+        for i in range(self.batch_size):
+            angle_x = np.random.randint(-max_rotation_angle, max_rotation_angle)
+            x_rot[i,:,:,:,:] = scipy.ndimage.interpolation.rotate(
+                x[i,:,:,:,:], angle_x, (1,2), False, mode="constant", cval=0, order=0)
+            y_rot[i,:,:,:] = scipy.ndimage.interpolation.rotate(
+                y[i,:,:,:], angle_x, (1,2), False, mode="constant", cval=0, order=0)
+                
+                #angle_y = np.random.randint(-max_rotation_angle, max_rotation_angle)
+                #x_rot[i,:,:,:,:] = scipy.ndimage.interpolation.rotate(
+                    #x_rot[i,:,:,:,:], angle_x, (0,2), False, mode=\constant\, cval=0, order=0)
+                #y_rot[i,:,:,:] = scipy.ndimage.interpolation.rotate(
+                    #y[i,:,:,:], angle_x, (0,2), False, mode=\constant\, cval=0, order=0)
+            
+            
+            # angle_z = np.random.randint(-max_rotation_angle, max_rotation_angle)
+            # x_rot = scipy.ndimage.interpolation.rotate(x, angle_z, (0,1), False, mode=\constant\, cval=0, order=0)
+            # y_rot = scipy.ndimage.interpolation.rotate(y, angle_z, (0,1), False, mode=\constant\, cval=0, order=0)
+            
+            # shift
+            
+        shift = np.random.uniform(-max_shift, max_shift, size=5)
+        shift[0] = 0.0
+        shift[4] = 0.0
+            # x_shift = scipy.ndimage.interpolation.shift(x_rot, shift)
+            # y_shift = scipy.ndimage.interpolation.shift(y_rot, shift[:4])
+            
+            # make sure values are between 0 and 1
+            
+            # x_aug = np.clip(x_shift, 0.0, 1.0)
+            # y_aug = np.clip(y_shift, 0.0, 1.0)
+            
+        x_aug = np.clip(x_rot, 0.0, 1.0)
+        y_aug = np.clip(y_rot, 0.0, 1.0)
+            # y_aug = y_aug.reshape((y_aug.shape[0], y_aug.shape[1], y_aug.shape[2], y_aug.shape[3], 1))
+            # convert segmentation to one-hot encoding
+            
+        y_onehot = keras.utils.to_categorical(y_aug, self.n_classes)
+        return x_aug, y_onehot
+    
+def dilateStack(segmentation_data, iterations):
+    return np.array([scipy.ndimage.binary_dilation(y, iterations=iterations) for y in segmentation_data])
+    
+width = 3
+segmentation_dilated = dilateStack(segmentation_data[:, :, :, :, :], width)
+
+num_classes = 2
+filter_multiplier = 6
+    
+def nvidia_unet(input_size=128, num_classes=num_classes, activation='softmax'):
+    input_ = Input((input_size, input_size, input_size, 1))
+    skips = []
+    output = input_
+    c = num_classes
+        
+    num_layers = int(np.floor(np.log2(input_size)))
+    down_conv_kernel_sizes = np.zeros([num_layers], dtype=int)
+    down_filter_numbers = np.zeros([num_layers], dtype=int)
+    up_conv_kernel_sizes = np.zeros([num_layers], dtype=int)
+    up_filter_numbers = np.zeros([num_layers], dtype=int)
+        
+    for layer_index in range(num_layers):
+        down_conv_kernel_sizes[layer_index] = int(3)
+        down_filter_numbers[layer_index] = int( (layer_index + 1) * filter_multiplier + num_classes )
+        up_conv_kernel_sizes[layer_index] = int(4)
+        up_filter_numbers[layer_index] = int( (num_layers - layer_index - 1) * filter_multiplier + num_classes )
+        
+    print("Number of layers:       {}".format(num_layers))
+    print("Filters in layers down: {}".format(down_filter_numbers))
+    print("Filters in layers up:   {}".format(up_filter_numbers))
+        
+    for shape, filters in zip(down_conv_kernel_sizes, down_filter_numbers):
+        skips.append(output)
+        output= Conv3D(filters, (shape, shape, shape), strides=2, padding="same", activation="relu")(output)
+            
+    for shape, filters in zip(up_conv_kernel_sizes, up_filter_numbers):
+        output = keras.layers.UpSampling3D()(output)
+        skip_output = skips.pop()
+        output = concatenate([output, skip_output], axis=4)
+    
+        if filters != num_classes:
+            output = Conv3D(filters, (shape, shape, shape), activation="relu", padding="same")(output)
+            output = BatchNormalization(momentum=.9)(output)
+        else:
+            output = Conv3D(filters, (shape, shape, shape), activation=activation, padding="same")(output)
+        
+    assert len(skips) == 0
+    return Model([input_], [output])
+
+def iou_coef(y_true, y_pred, smooth=1):
+  intersection = K.sum(K.abs(y_true * y_pred), axis=[1,2,3])
+  union = K.sum(y_true,[1,2,3])+K.sum(y_pred,[1,2,3])-intersection
+  iou = K.mean((intersection + smooth) / (union + smooth), axis=0)
+  return iou
+    
+def dice_coeff(y_true, y_pred, smooth=1e-6, gama=2):
+  y_true, y_pred = tf.cast(y_true, dtype=tf.float32), tf.cast(y_pred, tf.float32)
+  nominator = 2 * tf.reduce_sum(tf.multiply(y_pred, y_true)) + smooth
+  denominator = tf.reduce_sum(y_pred ** gama) + tf.reduce_sum(y_true ** gama) + smooth
+  result = tf.divide(nominator, denominator)
+  return result
+    
+def f1_score_metric(y_true, y_pred):
+  recall = tf.keras.metrics.Recall()
+  precision = tf.keras.metrics.Precision()
+  recall.update_state(y_true, y_pred)
+  recall_res = recall.result()
+  precision.update_state(y_true, y_pred)
+  precision_res = precision.result()
+  return 2 * precision_res * recall_res / (precision_res + recall_res)
+    
+def f1_metric(y_true, y_pred):
+  true_positives = K.sum(K.round(K.clip(y_true * y_pred, 0, 1)))
+  possible_positives = K.sum(K.round(K.clip(y_true, 0, 1)))
+  predicted_positives = K.sum(K.round(K.clip(y_pred, 0, 1)))
+  precision = true_positives / (predicted_positives + K.epsilon())
+  recall = true_positives / (possible_positives + K.epsilon())
+  f1_val = 2*(precision*recall)/(precision+recall+K.epsilon())
+  return f1_val
+
+from keras import backend as K
+    
+def customLoss(yTrue,yPred):
+  return K.sum(K.log(yTrue) - K.log(yPred))
+    
+def dice_loss(y_true, y_pred):
+  return 1.0-dice_coeff(y_true, y_pred)
+    
+def iou_loss(y_true, y_pred):
+  m = tf.keras.metrics.MeanIoU(num_classes=2)
+  m.update_state(y_true, y_pred)
+  return -tf.math.log(m.result())
+    
+def weighted_categorical_crossentropy(weights):
+  """"
+  A weighted version of keras.objectives.categorical_crossentropy
+    
+  Variables:
+      weights: numpy array of shape (C,) where C is the number of classes
+ """
+  weights = K.variable(weights)
+    
+  def loss(y_true, y_pred):
+      # scale predictions so that the class probas of each sample sum to 1
+      y_pred /= K.sum(y_pred, axis=-1, keepdims=True)
+      # clip to prevent NaN's and Inf's
+      y_pred = K.clip(y_pred, K.epsilon(), 1 - K.epsilon())
+      # calc
+      loss = y_true * K.log(y_pred) * weights
+      loss = -K.sum(loss, -1)
+    
+      return loss
+    
+  return loss
+    
+def weighted_categorical_crossentropy_helper(y_true, y_pred, weights):
+    # scale predictions so that the class probas of each sample sum to 1
+  y_pred /= K.sum(y_pred, axis=-1, keepdims=True)
+      # clip to prevent NaN's and Inf's
+  y_pred = K.clip(y_pred, K.epsilon(), 1 - K.epsilon())
+      # calc
+  loss = y_true * K.log(y_pred) * weights
+  loss = -K.sum(loss, -1)
+  return loss
+    
+def FocalLoss(targets, inputs, alpha=0.9, gamma=2):    
+  targets = K.cast(targets, 'float32')
+  BCE = K.binary_crossentropy(targets, inputs)
+  BCE_EXP = K.exp(-BCE)
+  focal_loss = K.mean(alpha * K.pow((1-BCE_EXP), gamma) * BCE)
+  return focal_loss
+    
+def weighted_bce_dice_loss(y_true, y_pred):
+  wcce = weighted_categorical_crossentropy_helper(y_true, y_pred, [0.0068, 1.0000])
+  dice = dice_loss(y_true, y_pred)
+  loss =  wcce + dice
+  return loss
+    
+def tversky(y_true, y_pred, smooth=1, alpha=0.7):
+  y_true_pos = K.flatten(y_true)
+  y_pred_pos = K.flatten(y_pred)
+  true_pos = K.sum(y_true_pos * y_pred_pos)
+  false_neg = K.sum(y_true_pos * (1 - y_pred_pos))
+  false_pos = K.sum((1 - y_true_pos) * y_pred_pos)
+  return (true_pos + smooth) / (true_pos + alpha * false_neg + (1 - alpha) * false_pos + smooth)
+    
+def tversky_loss(y_true, y_pred):
+  return 1 - tversky(y_true, y_pred)
+    
+def focal_tversky_loss(y_true, y_pred, gamma=0.75):
+  tv = tversky(y_true, y_pred)
+  return K.pow((1 - tv), gamma)
+    
+def wcce_focal(y_true, y_pred):
+  wcce = weighted_categorical_crossentropy_helper(y_true, y_pred, [0.0068, 1.0000])
+  focal = FocalLoss(y_true, y_pred)
+  loss = wcce + focal
+  return loss
+   
+def focal_dice(y_true, y_pred):
+  focal = FocalLoss(y_true, y_pred)
+  dice = dice_loss(y_true, y_pred)
+  return focal + dice
+    
+def bce_focal(y_true, y_pred):
+  focal = FocalLoss(y_true, y_pred)
+  bce = tf.keras.losses.BinaryCrossentropy(from_logits=True)
+  bce = bce(y_true, y_pred)
+  return focal + bce
+
+def visualize_model(model, training_log):
+  plt.figure(1)
+    
+  plt.subplot(211)
+  plt.plot(training_log.history['loss'], 'bo--')
+  plt.plot(training_log.history['val_loss'], 'ro-')
+  plt.ylabel('Loss')
+  plt.xlabel('Epochs (n)')
+  plt.legend(['Training loss', 'Validation loss'])
+  plt.show()
+    
+  plt.subplot(212)
+  plt.plot(training_log.history['accuracy'], 'bo--')
+  plt.plot(training_log.history['val_accuracy'], 'ro-')
+  plt.ylabel('Accuracy')
+  plt.xlabel('Epochs (n)')
+  plt.legend(['Training accuracy', 'Validation accuracy'])
+  plt.show()
+    
+      # ultrasound
+  ultrasound_img = test_ultrasound_data[5]
+  print(test_ultrasound_data[5].shape)
+  multi_slice_viewer(ultrasound_img[:, :, :, 0])
+    
+      # Segmentation
+  segmentation_img = test_segmentation_data[5]
+  print(segmentation_img.shape)
+  multi_slice_viewer(segmentation_img[:, :, :, 0])
+    
+  y_pred = model.predict(test_ultrasound_data)
+  print(np.unique(y_pred))
+      # Prediction
+  predicted_img = y_pred[5]
+  print(predicted_img.shape)
+  print(np.unique(predicted_img))
+  multi_slice_viewer(predicted_img[:, :, :, 1])
+    
+      # Prediction binary
+  predicted_img_bin = y_pred[5]
+  predicted_img_bin[predicted_img_bin >= 0.5] = 1
+  predicted_img_bin[predicted_img_bin < 0.5] = 0
+  print(predicted_img_bin.shape)
+  print(np.unique(predicted_img_bin))
+  multi_slice_viewer(predicted_img_bin[:, :, :, 1])
+  
+def evaluate_model(y_pred, slice_ex=5, threshold=0.5):
+  y_true = test_segmentation_data
+      # y_pred = model.predict(test_ultrasound_data)
+  y_true = y_true[:,:,:,:,0]
+  y_pred = y_pred[:,:,:,:,1]
+    
+  thresh = threshold_otsu(y_pred)
+  print(thresh)
+  y_pred[y_pred < 0.5] = 0
+  y_pred[y_pred >= 0.5] = 1
+      
+  print(y_true.shape)
+  print(y_pred.shape)
+      # True positive
+  tp = np.sum(y_true * y_pred)
+      # False positive
+  fp = np.sum((y_true == 0) * y_pred)
+      # True negative
+  tn = np.sum((y_true==0) * (y_pred==0))
+      # False negative
+  fn = np.sum(y_true * (y_pred==0))
+    
+      # True positive rate (sensitivity or recall)
+  tpr = tp / (tp + fn)
+      # False positive rate (fall-out)
+  fpr = fp / (fp + tn)
+      # Precision
+  precision = tp / (tp + fp)
+      # True negatvie tate (specificity)
+  tnr = 1 - fpr
+      # F1 score
+  f1 = 2*tp / (2*tp + fp + fn)
+      # F2 score
+  f2 = 5*tp / (4*fp + fn)
+    
+      # ROC-AUC for binary classification
+  auc = (tpr+tnr) / 2
+      # MCC
+  mcc = (tp * tn - fp * fn) / np.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+  ppv = tp/ (tp + fp)
+  print("True positive: ", tp)
+  print("False positive: ", fp)
+  print("True negative: ", tn)
+  print("False negative: ", fn)
+    
+  print("True positive rate (recall): ", tpr)
+  print("False positive rate: ", fpr)
+  print("Positive predictive value:", ppv)
+  print("Precision: ", precision)
+  print("True negative rate: ", tnr)
+  print("F1: ", f1)
+  print("F2: ", f2)
+  print("ROC-AUC: ", auc)
+  print("MCC: ", mcc)
+    
+  segmentation_img = test_segmentation_data[slice_ex,:,:,:,0]
+    
+  max_cath = 0
+  slice_num =0
+  for i in range(128):
+    curr_slice = segmentation_img[slice_num, :, :]
+    count = np.count_nonzero(segmentation_img[i, :, :])
+    if count > max_cath:
+      max_cath = count
+      slice_num = i
+      
+  print(segmentation_img.shape)
+  print(np.unique(segmentation_img))
+  plt.imshow(segmentation_img[slice_num, :, :], cmap="gray")
+  plt.show()
+    
+      # Prediction
+  predicted_img = y_pred[slice_ex]
+  print(predicted_img.shape)
+  print(np.unique(predicted_img))
+  plt.imshow(predicted_img[slice_num, :, :], cmap="gray")
+  plt.show()
+  
+training_generator = UltrasoundSegmentationBatchGenerator(
+    ultrasound_data,
+    segmentation_data,
+    batch_size,
+    image_dimensions=(ultrasound_size))
+val_generator = UltrasoundSegmentationBatchGenerator(
+    val_ultrasound_data,
+    val_segmentation_data,
+    batch_size,
+    image_dimensions=(ultrasound_size))
+test_generator = UltrasoundSegmentationBatchGenerator(
+    test_ultrasound_data,
+    test_segmentation_data,
+    1,
+    image_dimensions=(ultrasound_size))
+
+def evaluate_3d_masks(true_masks, pred_masks):
+        # initialize lists to store metrics
+    dice_list = []
+    jaccard_list = []
+    sensitivity_list = []
+    specificity_list = []
+    precision_list = []
+    accuracy_list = []
+    iou_list = []
+    
+        # iterate over all images in the test set
+    for i in range(len(true_masks)):
+            # compute the metrics for the current image
+        dice, jaccard, sensitivity, specificity, precision, accuracy, iou = evaluate_masks(true_masks[i], pred_masks[i])
+            # append the computed metrics to their respective lists if they are not 0
+        if dice != 0:
+            dice_list.append(dice)
+        if jaccard != 0:
+            jaccard_list.append(jaccard)
+        if sensitivity != 0:
+            sensitivity_list.append(sensitivity)
+        if specificity != 0:
+            specificity_list.append(specificity)
+        if precision != 0:
+            precision_list.append(precision)
+        if accuracy != 0:
+            accuracy_list.append(accuracy)
+        if iou != 0:
+            iou_list.append(iou)
+    
+        # compute the average metrics over the whole test set
+    dice_avg = np.mean(dice_list)
+    jaccard_avg = np.mean(jaccard_list)
+    sensitivity_avg = np.mean(sensitivity_list)
+    specificity_avg = np.mean(specificity_list)
+    precision_avg = np.mean(precision_list)
+    accuracy_avg = np.mean(accuracy_list)
+    iou_avg = np.mean(iou_list)
+    
+    print("dice_avg: ", dice_avg)
+    print("jaccard_avg: ", jaccard_avg)
+    print("sensitivity_avg: ", sensitivity_avg)
+    print("specificity_avg: ", specificity_avg)
+    print("precision_avg: ", precision_avg)
+    print("accuracy_avg: ", accuracy_avg)
+    print("iou_avg: ", iou_avg)
+    
+        # return the average metrics
+        # return dice_avg, jaccard_avg, sensitivity_avg, specificity_avg, precision_avg
+    
+    
+def dice_coefficient(true_mask, pred_mask):
+        # compute the dice coefficient if the sum of the true and predicted masks is not zero
+    if np.sum(true_mask) + np.sum(pred_mask) != 0:
+            dice = (2 * np.sum(true_mask * pred_mask)) / (np.sum(true_mask) + np.sum(pred_mask))
+        # otherwise set the dice coefficient to zero
+    else:
+        dice = 0
+        # return the computed dice coefficient
+    return dice
+    
+    
+def jaccard_index(true_mask, pred_mask):
+        # compute the jaccard index if the sum of the true and predicted masks minus the sum of the true and predicted masks
+        # multiplied together is not zero
+    if np.sum(true_mask) + np.sum(pred_mask) - np.sum(true_mask * pred_mask) != 0:
+        jaccard = np.sum(true_mask * pred_mask) / (
+                    np.sum(true_mask) + np.sum(pred_mask) - np.sum(true_mask * pred_mask))
+        # otherwise set the jaccard index to zero
+    else:
+        jaccard = 0
+        # return the computed jaccard index
+    return jaccard
+    
+    
+def sensitivity_index(true_mask, pred_mask):
+        # compute the sensitivity if the sum of the true mask is not zero
+    if np.sum(true_mask) != 0:
+        sensitivity = np.sum(true_mask * pred_mask) / np.sum(true_mask)
+        # otherwise set the sensitivity to zero
+    else:
+        sensitivity = 0
+        # return the computed sensitivity
+    return sensitivity
+    
+    
+def specificity_index(true_mask, pred_mask):
+        # compute the specificity if the sum of the true mask and the predicted mask is not zero
+    if np.sum(true_mask) + np.sum(pred_mask) != 0:
+        specificity = np.sum((1 - true_mask) * (1 - pred_mask)) / np.sum(1 - true_mask)
+        # otherwise set the specificity to zero
+    else:
+        specificity = 0
+        # return the computed specificity
+    return specificity
+    
+    
+def precision_index(true_mask, pred_mask):
+        # compute the precision if the sum of the predicted mask is not zero
+    if np.sum(pred_mask) != 0:
+        precision = np.sum(true_mask * pred_mask) / np.sum(pred_mask)
+        # otherwise set the precision to zero
+    else:
+        precision = 0
+        # return the computed precision
+    return precision
+    
+    
+def accuracy_index(true_mask, pred_mask):
+        # compute the accuracy
+    accuracy = (np.sum(true_mask * pred_mask) + np.sum((1 - true_mask) * (1 - pred_mask))) / (
+            np.sum(true_mask) + np.sum(1 - true_mask))
+    
+        # return the computed accuracy
+    return accuracy
+    
+    
+def iou_index(true_mask, pred_mask):
+        # compute the iou if the sum of the true and predicted masks minus the sum of the true and predicted masks
+        # multiplied together is not zero
+    if np.sum(true_mask) + np.sum(pred_mask) - np.sum(true_mask * pred_mask) != 0:
+        iou = np.sum(true_mask * pred_mask) / (np.sum(true_mask) + np.sum(pred_mask) - np.sum(true_mask * pred_mask))
+        # otherwise set the iou to zero
+    else:
+        iou = 0
+        # return the computed iou
+    return iou
+    
+    
+def evaluate_masks(true_mask, pred_mask):
+        # compute the dice coefficient
+    dice = dice_coefficient(true_mask, pred_mask)
+        # compute the jaccard index
+    jaccard = jaccard_index(true_mask, pred_mask)
+        # compute the sensitivity
+    sensitivity = sensitivity_index(true_mask, pred_mask)
+        # compute the specificity
+    specificity = specificity_index(true_mask, pred_mask)
+        # compute the precision
+    precision = precision_index(true_mask, pred_mask)
+        # compute the accuracy
+    accuracy = accuracy_index(true_mask, pred_mask)
+        # compute the iou
+    iou = iou_index(true_mask, pred_mask)
+    
+        # return the computed metrics
+    return dice, jaccard, sensitivity, specificity, precision, accuracy, iou
+    
+    
+    # function that takes a 4d array and turns it into a list of 3d arrays
+def split_4d_array(array):
+        # initialize list to store the 3d arrays
+    array_list = []
+        # iterate over all images in the 4d array
+    for i in range(len(array)):
+            # append the current image to the list
+        array_list.append(array[i])
+        # return the list of 3d arrays
+    return array_list
+    
+    
+    # function that takes a list of 3d array and turns it into a list of 2d arrays
+def split_3d_array(array_list):
+        # initialize list to store the 2d arrays
+    array = []
+        # iterate over all images in the list
+    for i in range(len(array_list)):
+            # iterate over all slices in the current image
+        for j in range(len(array_list[i])):
+                # append the current slice to the list
+            array.append(array_list[i][j])
+        # return the list of 2d arrays
+    return array
+    
+    
+    # function that takes a list of 2d arrays and turns it into an array of 2d arrays
+def merge_2d_array(array_list):
+        # initialize array to store the 2d arrays
+    array = np.zeros((len(array_list), array_list[0].shape[0], array_list[0].shape[1]))
+        # iterate over all slices in the list
+    for i in range(len(array_list)):
+            # append the current slice to the array
+        array[i] = array_list[i]
+        # return the array of 2d arrays
+    return array
+
+max_learning_rate = 0.01
+min_learning_rate = 0.00001
+   
+model_dice_loss = nvidia_unet(ultrasound_size[0], num_classes)
+learning_rate_decay = (max_learning_rate - min_learning_rate) / num_epochs
+    
+    # Early stopping
+callback = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10)
+filename='/Users/Jessica/Desktop/3DUnetSaved Models/model_dice_loss.csv'
+history_logger=tf.keras.callbacks.CSVLogger(filename, separator=",", append=True)
+    
+model_dice_loss.compile(optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=max_learning_rate, decay=learning_rate_decay),
+               loss=dice_loss, metrics=["accuracy", 
+                                        dice_coeff, 
+                                        tf.keras.metrics.Precision(), 
+                                        tf.keras.metrics.Recall(), 
+                                        iou_coef])
+    
+print("Learning rate decay = {}".format(learning_rate_decay))
+
+model_dice_loss.compile(optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=max_learning_rate, decay=learning_rate_decay),
+               loss=dice_loss, metrics=["accuracy", 
+                                        dice_coeff, 
+                                        tf.keras.metrics.Precision(), 
+                                        tf.keras.metrics.Recall(), 
+                                        iou_coef])
+training_time_start = datetime.datetime.now()
+    
+training_log_dice = model_dice_loss.fit_generator(training_generator,
+                                   validation_data=val_generator,
+                                   epochs=num_epochs,
+                                   verbose=1, callbacks=[callback, history_logger])
+    
+timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    
+saved_models_folder = '/Users/Jessica/Desktop/3DUnetSaved Models'
+model_file_name = "model_dice_loss_" + timestamp + ".h5"
+weights_file_path = os.path.join(saved_models_folder, model_file_name)
+    
+model_dice_loss.save(weights_file_path)
+print("Unet Model saved to: {}".format(weights_file_path))
+
+training_log_dice = model_dice_loss.fit_generator(training_generator,
+                                   validation_data=val_generator,
+                                   epochs=num_epochs,
+                                   verbose=1, callbacks=[callback, history_logger])
+visualize_model(model_dice_loss, training_log_dice)
+
+y_pred = model_dice_loss.predict(test_ultrasound_data)
+evaluate_model(y_pred)
+
+max_learning_rate = 0.01
+min_learning_rate = 0.00001
+    
+model_tversky_focal = nvidia_unet(ultrasound_size[0], num_classes)
+learning_rate_decay = (max_learning_rate - min_learning_rate) / num_epochs
+    
+    # Early stopping
+callback = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10)
+filename='/Users/Jessica/Desktop/3DUnetSaved Models/model_tversky_focal.csv'
+history_logger=tf.keras.callbacks.CSVLogger(filename, separator=",", append=True)
+model_tversky_focal.compile(optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=max_learning_rate, decay=learning_rate_decay),
+               loss=focal_tversky_loss, metrics=["accuracy", 
+                                                dice_coeff, 
+                                                tf.keras.metrics.Precision(), 
+                                                tf.keras.metrics.Recall(), 
+                                                iou_coef])
+    
+print("Learning rate decay = {}".format(learning_rate_decay))
+
+training_time_start = datetime.datetime.now()
+    
+training_log_tversky_focal = model_tversky_focal.fit_generator(training_generator,
+                                   validation_data=val_generator,
+                                   epochs=num_epochs,
+                                   verbose=1, callbacks=[callback,history_logger])
+    
+timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    
+saved_models_folder = '/Users/Jessica/Desktop/3DUnetSaved Models'
+model_file_name = "model_tversky_focal_" + timestamp + ".h5"
+weights_file_path = os.path.join(saved_models_folder, model_file_name)
+    
+model_tversky_focal.save(weights_file_path)
+print("Unet Model saved to: {}".format(weights_file_path))
+
+visualize_model(model_tversky_focal, training_log_tversky_focal)
+
+y_pred = model_tversky_focal.predict(test_ultrasound_data)
+evaluate_model(y_pred)
+
+max_learning_rate = 0.01
+min_learning_rate = 0.00001
+    
+model_focal_loss = nvidia_unet(ultrasound_size[0], num_classes)
+learning_rate_decay = (max_learning_rate - min_learning_rate) / num_epochs
+    # Early stopping
+callback = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=20)
+filename='/Users/Jessica/Desktop/3DUnetSaved Models/model_focal_loss.csv'
+history_logger=tf.keras.callbacks.CSVLogger(filename, separator=",", append=True)
+model_focal_loss.compile(optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=max_learning_rate, decay=learning_rate_decay),
+               loss=FocalLoss, metrics=["accuracy", 
+                                        dice_coeff, 
+                                        tf.keras.metrics.Precision(),
+                                        tf.keras.metrics.Recall(), 
+                                        iou_coef])
+print("Learning rate decay = {}".format(learning_rate_decay))
+
+training_time_start = datetime.datetime.now()
+training_log_focal_loss = model_focal_loss.fit(training_generator,
+                                   validation_data=val_generator,
+                                   epochs=num_epochs,
+                                   verbose=1, callbacks=[callback,history_logger])
+    
+timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    
+saved_models_folder = '/Users/Jessica/Desktop/3DUnetSaved Models'
+model_file_name = "model_focal_loss_" + timestamp + ".h5"
+weights_file_path = os.path.join(saved_models_folder, model_file_name)
+    
+model_focal_loss.save(weights_file_path)
+print("Unet Model saved to: {}".format(weights_file_path))
+
+y_pred = model_focal_loss.predict(test_ultrasound_data)
+
+evaluate_3d_masks(test_segmentation_data, y_pred)
+
+np.save('/Users/Jessica/Desktop/3DUnetSaved Models/test.npy', test_segmentation_data)
+np.save('/Users/Jessica/Desktop/3DUnetSaved Models/pred.npy', y_pred)
+
+max_learning_rate = 0.01
+min_learning_rate = 0.00001
+    
+model_iou = nvidia_unet(ultrasound_size[0], num_classes)
+learning_rate_decay = (max_learning_rate - min_learning_rate) / num_epochs
+    
+    # Early stopping
+callback = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10)
+filename='/Users/Jessica/Desktop/3DUnetSaved Models/model_iou.csv'
+history_logger=tf.keras.callbacks.CSVLogger(filename, separator=",", append=True)
+model_iou.compile(optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=max_learning_rate, decay=learning_rate_decay),
+               loss=jacard_coef_loss, 
+               metrics=["accuracy", 
+                        dice_coeff, 
+                        tf.keras.metrics.Precision(), 
+                        tf.keras.metrics.Recall(), 
+                        iou_coef])
+print("Learning rate decay = {}".format(learning_rate_decay))
+
+training_time_start = datetime.datetime.now()
+    
+training_log_iou = model_iou.fit_generator(training_generator,
+                                   validation_data=val_generator,
+                                   epochs=num_epochs,
+                                   verbose=1, callbacks=[callback,history_logger])
+    
+    
+timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    
+saved_models_folder = '/Users/Jessica/Desktop/3DUnetSaved Models'
+model_file_name = "model_iou_" + timestamp + ".h5"
+weights_file_path = os.path.join(saved_models_folder, model_file_name)
+    
+model_iou.save(weights_file_path)
+print("Unet Model saved to: {}".format(weights_file_path))
+
+visualize_model(model_iou, training_log_iou)
+
+y_pred = model_iou.predict(test_ultrasound_data)
+evaluate_model(y_pred)
+
+max_learning_rate = 0.01
+min_learning_rate = 0.00001
+    
+model_wcce = nvidia_unet(ultrasound_size[0], num_classes)
+learning_rate_decay = (max_learning_rate - min_learning_rate) / num_epochs
+    
+    # Early stopping
+callback = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10)
+filename='/Users/Jessica/Desktop/3DUnetSaved Models/model_wcce.csv'
+history_logger=tf.keras.callbacks.CSVLogger(filename, separator=",", append=True)
+model_wcce.compile(optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=max_learning_rate, decay=learning_rate_decay),
+               loss=weighted_categorical_crossentropy([0.0068, 1.0000]), 
+               metrics=["accuracy", 
+                        dice_coeff, 
+                        tf.keras.metrics.Precision(), 
+                        tf.keras.metrics.Recall(), 
+                        iou_coef])
+print("Learning rate decay = {}".format(learning_rate_decay))
+    
+training_time_start = datetime.datetime.now()
+    
+training_log_wcce = model_wcce.fit_generator(training_generator,
+                                   validation_data=val_generator,
+                                   epochs=num_epochs,
+                                   verbose=1, callbacks=[callback,history_logger])
+    
+    
+timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    
+saved_models_folder = '/Users/Jessica/Desktop/3DUnetSaved Models'
+model_file_name = "model_wcce_" + timestamp + ".h5"
+weights_file_path = os.path.join(saved_models_folder, model_file_name)
+    
+model_wcce.save(weights_file_path)
+print("Unet Model saved to: {}".format(weights_file_path))
+
+visualize_model(model_wcce, training_log_wcce)
+
+y_pred = model_wcce.predict(test_ultrasound_data)
+evaluate_model(y_pred)
+
+max_learning_rate = 0.01
+min_learning_rate = 0.00001
+    
+model_weighted_bce_dice_loss = nvidia_unet(ultrasound_size[0], num_classes)
+learning_rate_decay = (max_learning_rate - min_learning_rate) / num_epochs
+    
+    # Early stopping
+callback = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10)
+filename='/Users/Jessica/Desktop/3DUnetSaved Models/model_weighted_bce_dice_loss.csv'
+history_logger=tf.keras.callbacks.CSVLogger(filename, separator=",", append=True)
+model_weighted_bce_dice_loss.compile(optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=max_learning_rate, decay=learning_rate_decay),
+               loss=weighted_bce_dice_loss, metrics=["accuracy", 
+                                                      dice_coeff, 
+                                                      tf.keras.metrics.Precision(), 
+                                                      tf.keras.metrics.Recall(), 
+                                                      iou_coef])
+    
+print("Learning rate decay = {}".format(learning_rate_decay))
+
+training_time_start = datetime.datetime.now()
+    
+training_log_weighted_bce_dice_loss = model_weighted_bce_dice_loss.fit_generator(training_generator,
+                                   validation_data=val_generator,
+                                   epochs=num_epochs,
+                                   verbose=1, callbacks=[callback,history_logger])
+    
+timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    
+saved_models_folder = '/Users/Jessica/Desktop/3DUnetSaved Models'
+model_file_name = "model_weighted_bce_dice_loss_" + timestamp + ".h5"
+weights_file_path = os.path.join(saved_models_folder, model_file_name)
+    
+model_weighted_bce_dice_loss.save(weights_file_path)
+print("Unet Model saved to: {}".format(weights_file_path))
+
+visualize_model(model_weighted_bce_dice_loss, training_log_weighted_bce_dice_loss)
+
+y_pred = model_weighted_bce_dice_loss.predict(test_ultrasound_data)
+evaluate_model(y_pred)
+
+max_learning_rate = 0.01
+min_learning_rate = 0.00001
+    
+model_wcce_focal = nvidia_unet(ultrasound_size[0], num_classes)
+learning_rate_decay = (max_learning_rate - min_learning_rate) / num_epochs
+    
+    # Early stopping
+callback = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10)
+filename='/Users/Jessica/Desktop/3DUnetSaved Models/model_wcce_focal.csv'
+history_logger=tf.keras.callbacks.CSVLogger(filename, separator=",", append=True)
+model_wcce_focal.compile(optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=max_learning_rate, decay=learning_rate_decay),
+               loss=wcce_focal, metrics=["accuracy", 
+                                          dice_coeff, 
+                                          tf.keras.metrics.Precision(), 
+                                          tf.keras.metrics.Recall(), 
+                                          iou_coef])
+    
+print("Learning rate decay = {}".format(learning_rate_decay))
+
+training_time_start = datetime.datetime.now()
+    
+training_log_wcce_focal = model_wcce_focal.fit_generator(training_generator,
+                                   validation_data=val_generator,
+                                   epochs=num_epochs,
+                                   verbose=1, callbacks=[callback,history_logger])
+    
+timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    
+saved_models_folder = '/Users/Jessica/Desktop/3DUnetSaved Models'
+model_file_name = "model_wcce_focal_" + timestamp + ".h5"
+weights_file_path = os.path.join(saved_models_folder, model_file_name)
+    
+model_wcce_focal.save(weights_file_path)
+print("Unet Model saved to: {}".format(weights_file_path))
+
+visualize_model(model_wcce_focal, training_log_wcce_focal)
+
+y_pred = model_wcce_focal.predict(test_ultrasound_data)
+evaluate_model(y_pred)
+
+max_learning_rate = 0.01
+min_learning_rate = 0.00001
+    
+model_bce = nvidia_unet(ultrasound_size[0], num_classes)
+learning_rate_decay = (max_learning_rate - min_learning_rate) / num_epochs
+    
+    # Early stopping
+callback = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10)
+filename='/Users/Jessica/Desktop/3DUnetSaved Models/model_bce.csv'
+history_logger=tf.keras.callbacks.CSVLogger(filename, separator=",", append=True)
+model_bce.compile(optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=max_learning_rate, decay=learning_rate_decay),
+               loss="binary_crossentropy", metrics=["accuracy", 
+                                                      dice_coeff, 
+                                                      tf.keras.metrics.Precision(), 
+                                                      tf.keras.metrics.Recall(), 
+                                                      iou_coef])
+    
+print("Learning rate decay = {}".format(learning_rate_decay))
+
+training_time_start = datetime.datetime.now()
+    
+training_log_bce = model_bce.fit_generator(training_generator,
+                                   validation_data=val_generator,
+                                   epochs=num_epochs,
+                                   verbose=1, callbacks=[callback,history_logger])
+   
+timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    
+saved_models_folder = '/Users/Jessica/Desktop/3DUnetSaved Models'
+model_file_name = "model_bce_" + timestamp + ".h5"
+weights_file_path = os.path.join(saved_models_folder, model_file_name)
+    
+model_bce.save(weights_file_path)
+print("Unet Model saved to: {}".format(weights_file_path))
+
+visualize_model(model_bce, training_log_bce)
+
+y_pred = model_bce.predict(test_ultrasound_data)
+evaluate_model(y_pred)
+
+max_learning_rate = 0.01
+min_learning_rate = 0.00001
+    
+model_cce = nvidia_unet(ultrasound_size[0], num_classes)
+learning_rate_decay = (max_learning_rate - min_learning_rate) / num_epochs
+    
+    # Early stopping
+callback = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10)
+filename='/Users/Jessica/Desktop/3DUnetSaved Models/model_cce.csv'
+history_logger=tf.keras.callbacks.CSVLogger(filename, separator=",", append=True)
+model_cce.compile(optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=max_learning_rate, decay=learning_rate_decay),
+               loss="categorical_crossentropy", metrics=["accuracy", 
+                                                      dice_coeff, 
+                                                      tf.keras.metrics.Precision(), 
+                                                      tf.keras.metrics.Recall(), 
+                                                      iou_coef])
+    
+print("Learning rate decay = {}".format(learning_rate_decay))
+
+training_time_start = datetime.datetime.now()
+    
+training_log_model_cce = model_cce.fit_generator(training_generator,
+                                   validation_data=val_generator,
+                                   epochs=num_epochs,
+                                   verbose=1, callbacks=[callback,history_logger])
+    
+timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    
+saved_models_folder = '/Users/Jessica/Desktop/3DUnetSaved Models'
+model_file_name = "model_cce_" + timestamp + ".h5"
+weights_file_path = os.path.join(saved_models_folder, model_file_name)
+    
+model_cce.save(weights_file_path)
+print("Unet Model saved to: {}".format(weights_file_path))
+
+visualize_model(model_cce, training_log_model_cce)
+
+y_pred = model_cce.predict(test_ultrasound_data)
+evaluate_model(y_pred)
+
+max_learning_rate = 0.01
+min_learning_rate = 0.00001
+    
+model_wcce_og = nvidia_unet(ultrasound_size[0], num_classes)
+learning_rate_decay = (max_learning_rate - min_learning_rate) / num_epochs
+    
+    # Early stopping
+callback = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10)
+filename='/Users/Jessica/Desktop/3DUnetSaved Models/model_wcce_og.csv'
+history_logger=tf.keras.callbacks.CSVLogger(filename, separator=",", append=True)
+model_wcce_og.compile(optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=max_learning_rate, decay=learning_rate_decay),
+               loss=weighted_categorical_crossentropy([0.05, 0.95]), 
+               metrics=["accuracy", 
+                        dice_coeff, 
+                        tf.keras.metrics.Precision(), 
+                        tf.keras.metrics.Recall(), 
+                        iou_coef])
+print("Learning rate decay = {}".format(learning_rate_decay))
+
+training_time_start = datetime.datetime.now()
+    
+training_log_wcce_og = model_wcce_og.fit_generator(training_generator,
+                                   validation_data=val_generator,
+                                   epochs=num_epochs,
+                                   verbose=1, callbacks=[callback,history_logger])
+    
+    
+timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    
+saved_models_folder = '/Users/Jessica/Desktop/3DUnetSaved Models'
+model_file_name = "model_wcce_og_" + timestamp + ".h5"
+weights_file_path = os.path.join(saved_models_folder, model_file_name)
+    
+model_wcce_og.save(weights_file_path)
+print("Unet Model saved to: {}".format(weights_file_path))
+
+visualize_model(model_wcce_og, training_log_wcce)
+
+# model_wcce_og.load_weights("""/content/model_2021-12-04_01-15-36.h5"""),
+# y_pred = model_wcce_og.predict(test_ultrasound_data)
+# evaluate_model(y_pred)
+
+max_learning_rate = 0.01
+min_learning_rate = 0.00001
+
+model_bce_focal = nvidia_unet(ultrasound_size[0], num_classes)
+learning_rate_decay = (max_learning_rate - min_learning_rate) / num_epochs
+
+# Early stopping
+callback = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10)
+filename = '/Users/Jessica/Desktop/3DUnetSaved Models/model_bce_focal.csv'
+history_logger = tf.keras.callbacks.CSVLogger(filename, separator=",", append=True)
+model_bce_focal.compile(
+    optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=max_learning_rate, decay=learning_rate_decay),
+    loss=bce_focal,
+    metrics=[
+        "accuracy",
+        dice_coeff,
+        tf.keras.metrics.Precision(),
+        tf.keras.metrics.Recall(),
+        iou_coef
+    ]
+)
+print("Learning rate decay =", learning_rate_decay)
+
+training_time_start = datetime.datetime.now()
+    
+training_log_model_bce_focal = model_bce_focal.fit_generator(training_generator,
+                                   validation_data=val_generator,
+                                   epochs=num_epochs,
+                                   verbose=1, callbacks=[callback,history_logger])
+   
+timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    
+saved_models_folder = '/Users/Jessica/Desktop/3DUnetSaved Models'
+model_file_name = "model_bce_focal_" + timestamp + ".h5"
+weights_file_path = os.path.join(saved_models_folder, model_file_name)
+    
+model_bce_focal.save(weights_file_path)
+print("Unet Model saved to: {}".format(weights_file_path))
+
+visualize_model(model_bce_focal, training_log_model_bce_focal)
+
+y_pred = model_bce_focal.predict(test_ultrasound_data)
+evaluate_model(y_pred)
+
+y_pred_one = model_focal_loss.predict(test_ultrasound_data)
+
+plt.imshow(y_pred_one[0,50,:,:,1])
+plt.show()
+plt.imshow(test_segmentation_data[0,50,:,:,0])
+plt.show()
+
+np.save('pred_array.npy', y_pred_one[0,:,:,:,1])
+
+from google.colab import files
+zip -r /content/saved_models.zip /content/saved_models
+files.download('/content/saved_models.zip')

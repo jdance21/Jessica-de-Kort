@@ -1,0 +1,138 @@
+
+import keras
+import numpy as np
+from keras.models import Model
+from keras.layers import Input, Conv3D, concatenate, BatchNormalization
+from keras import backend as K
+import tensorflow as tf
+from scipy.ndimage import label
+
+test_ultrasound_fullname = r'\Users\Jessica\Desktop\Processed Data\Testing\test_image_array.npy'
+test_segmentation_fullname = r'\Users\Jessica\Desktop\Processed Data\Testing\test_segmentation_array.npy'
+test_ultrasound_data = np.load(test_ultrasound_fullname)
+test_segmentation_data = np.load(test_segmentation_fullname)
+testing_ultrasound_data = np.reshape(test_ultrasound_data, (test_ultrasound_data.shape[0], 128, 128, 128, 1))
+testing_segmentation_data = np.reshape(test_segmentation_data, (test_segmentation_data.shape[0], 128, 128, 128, 1))
+ultrasound_fullname = r'\Users\Jessica\Desktop\Processed Data\Training\training_image_array.npy'
+ultrasound_data = np.load(ultrasound_fullname)
+ultrasound_size = ultrasound_data.shape[1:4]
+
+num_classes = 2
+filter_multiplier = 6
+
+# from Nikki's code
+def nvidia_unet(input_size=128, num_classes=num_classes, activation='softmax'):
+    input_ = Input((input_size, input_size, input_size, 1))
+    skips = []
+    output = input_
+    c = num_classes
+    num_layers = int(np.floor(np.log2(input_size)))
+    down_conv_kernel_sizes = np.zeros([num_layers], dtype=int)
+    down_filter_numbers = np.zeros([num_layers], dtype=int)
+    up_conv_kernel_sizes = np.zeros([num_layers], dtype=int)
+    up_filter_numbers = np.zeros([num_layers], dtype=int)
+    for layer_index in range(num_layers):
+        down_conv_kernel_sizes[layer_index] = int(3)
+        down_filter_numbers[layer_index] = int( (layer_index + 1) * filter_multiplier + num_classes )
+        up_conv_kernel_sizes[layer_index] = int(4)
+        up_filter_numbers[layer_index] = int( (num_layers - layer_index - 1) * filter_multiplier + num_classes )
+    print("Number of layers:       {}".format(num_layers))
+    print("Filters in layers down: {}".format(down_filter_numbers))
+    print("Filters in layers up:   {}".format(up_filter_numbers))
+    for shape, filters in zip(down_conv_kernel_sizes, down_filter_numbers):
+        skips.append(output)
+        output= Conv3D(filters, (shape, shape, shape), strides=2, padding="same", activation="relu")(output)            
+    for shape, filters in zip(up_conv_kernel_sizes, up_filter_numbers):
+        output = keras.layers.UpSampling3D()(output)
+        skip_output = skips.pop()
+        output = concatenate([output, skip_output], axis=4)
+        if filters != num_classes:
+            output = Conv3D(filters, (shape, shape, shape), activation="relu", padding="same")(output)
+            output = BatchNormalization(momentum=.9)(output)
+        else:
+            output = Conv3D(filters, (shape, shape, shape), activation=activation, padding="same")(output)
+    assert len(skips) == 0
+    return Model([input_], [output]) #line 547 in Niki's code
+
+model = nvidia_unet()
+model_focal_loss = nvidia_unet(ultrasound_size[0], num_classes)
+y_pred = model_focal_loss.predict(testing_ultrasound_data)
+
+# from Nikki's code
+def dice_coefficient(y_true, y_pred, smooth=1e-6, gama=2):
+  y_true, y_pred = tf.cast(y_true, dtype=tf.float32), tf.cast(y_pred, tf.float32)
+  nominator = 2 * tf.reduce_sum(tf.multiply(y_pred, y_true)) + smooth
+  denominator = tf.reduce_sum(y_pred ** gama) + tf.reduce_sum(y_true ** gama) + smooth
+  result = tf.divide(nominator, denominator)
+  return result #line 605 in Niki's code
+
+# from Nikki's code
+def FocalLoss(targets, inputs, alpha=0.9, gamma=2):    
+  targets = K.cast(targets, 'float32')
+  BCE = K.binary_crossentropy(targets, inputs)
+  BCE_EXP = K.exp(-BCE)
+  focal_loss = K.mean(alpha * K.pow((1-BCE_EXP), gamma) * BCE)
+  return focal_loss #line 684 in Niki's code
+
+def calculate_metrics(testing_segmentation_data, testing_ultrasound_data):
+    # Initialize metrics accumulators
+    total_dice = 0.0
+    num_slices = testing_segmentation_data.shape[0]
+    num_clusters = 0
+    # Iterate through each slice
+    for slice_idx in range(num_slices):
+        slice_seg = testing_segmentation_data[slice_idx]
+        slice_ult = testing_ultrasound_data[slice_idx]
+        # Find the labeled clusters
+        labeled_array, num_clusters_slice = label(slice_seg == 1)
+        num_clusters += num_clusters_slice
+        # Convert test_seg and test_img to binary arrays
+        slice_seg_binary = (slice_seg == 1).astype(int)
+        slice_ult_binary = (slice_ult >= 0.5).astype(int)
+        # Ensure both arrays have the same shape
+        if slice_ult_binary.shape[-1] > 1:
+            slice_ult_binary = slice_ult_binary[..., 0]
+        # Iterate over each cluster
+        for cluster_idx in range(1, num_clusters_slice + 1):
+            # Find the coordinates of the cluster
+            cluster_coords = np.where(labeled_array == cluster_idx)
+            # Get the center coordinates of the cluster
+            center_x = int(np.mean(cluster_coords[0]))
+            center_y = int(np.mean(cluster_coords[1]))
+            # Calculate the bounding box coordinates around the center
+            x_min = max(0, center_x - 1)
+            x_max = min(slice_seg.shape[0], center_x + 2)
+            y_min = max(0, center_y - 1)
+            y_max = min(slice_seg.shape[1], center_y + 2)
+            # Extract the region of interest from slice_seg and slice_img
+            roi_seg = slice_seg_binary[x_min:x_max, y_min:y_max]
+            roi_img = slice_ult_binary[x_min:x_max, y_min:y_max]
+            # Calculate true positives, false positives, and false negatives for the region
+            true_positives = np.sum(roi_seg & roi_img)
+            false_positives = np.sum(roi_img) - true_positives
+            false_negatives = np.sum(roi_seg) - true_positives
+            # Calculate Dice coefficient, precision, and recall for the region
+            dice = (2.0 * true_positives) / (2.0 * true_positives + false_positives + false_negatives)
+            # Check if denominator is zero for precision calculation
+            if true_positives + false_positives == 0:
+                precision = 0.0
+            else:
+                precision = true_positives / (true_positives + false_positives)
+            recall = true_positives / (true_positives + false_negatives)
+            # Accumulate metrics
+            total_dice += dice
+    # Calculate average metrics
+    average_dice = total_dice / num_clusters
+    print("Average Dice Coefficient:", average_dice)
+   # print("Average Recall:", np.mean(recall))
+   # print("Average Precision:", np.mean(precision))
+
+# Load the U-Net model with focal loss
+model_focal_loss = nvidia_unet(ultrasound_size[0], num_classes)
+model_focal_loss.compile(optimizer='adam', loss=FocalLoss, metrics=[dice_coefficient])
+
+# Apply threshold to the predicted segmentation and convert to binary array
+thresholded_pred = (y_pred[..., 0] >= 0.5).astype(int)
+
+# Calculate metrics using the predicted segmentation and ground truths
+calculate_metrics(testing_segmentation_data, testing_ultrasound_data)

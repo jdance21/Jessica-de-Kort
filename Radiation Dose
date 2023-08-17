@@ -1,0 +1,18 @@
+## Use in 3D Slicer
+## Finds doses in Gray
+
+# Go to Volume Module, Volume Information, Convert to label map to select Label Map and select the node you want
+
+# Replace '1: RTSTRUCT: OCP RTS v4.2.2.CTV1' with name of node 
+dose_volume = slicer.util.getNode('1: RTSTRUCT: OCP RTS v4.2.2.CTV1')  # Replace <Dose Volume Node Name> with the actual name of the dose volume node
+dose_array = slicer.util.arrayFromVolume(dose_volume)
+min_dose = np.min(dose_array)
+max_dose = np.max(dose_array)
+mean_dose = np.mean(dose_array)
+total_dose = np.sum(dose_array)
+
+# Prints numbers with two decimals and Gy to represent Gray
+print("Minimum dose: {:.2f} Gy".format(min_dose))
+print("Maximum dose: {:.2f} Gy".format(max_dose))
+print("Mean dose: {:.2f} Gy".format(mean_dose))
+print("Total dose: {:.2f} Gy".format(total_dose))
